@@ -1,45 +1,27 @@
-# OTA update behavior
+# Update behavior
 
-> Read before touching the update flow or update UI, adding P2P data to the
-> worker, or when debugging how OTA updates land. Only
-> non-obvious, code-verified facts — the code is the reference for everything
-> else. Index: [AGENTS.md](../AGENTS.md).
+> Read this before touching `package.json#upgrade`, update behavior, or release assumptions.
+> PearDrop does not implement application updates.
 
-Flow: stage a new build (as described in README) → the worker's swarm replicates the drive → the
-updater mirrors the bundle → pipe strings flip the renderer UI → apply → relaunch.
+## Current contract
 
-Timing:
+1. `pear-runtime` hosts the fixed PearDrop transfer worker only.
+2. `workers/main.js` contains transfer logic, not `hello-pear-worker` or updater logic.
+3. Electron exposes no apply, relaunch, update-status, arbitrary-worker, or raw-worker IPC.
+4. The renderer contains no updater state or controls.
+5. The hidden `--no-updates` flag is accepted only because the existing `npm start` script
+   passes it; the flag has no runtime effect.
 
-- Immediate check at every launch; after a drive append, a check on a randomized
-  delay (drawn once per process, ≤1 h by default; appends within 60 s of boot check
-  immediately; each new append reschedules the pending check).
-- Only strictly-newer semver wins. **No downgrade path** — a rollback must be
-  re-staged under a _higher_ version.
+Keep the exact `package.json#upgrade` value unchanged. It remains preserved release metadata;
+PearDrop does not read it or claim OTA support.
 
-Apply:
+## Out of scope
 
-- Works: macOS `.app` and Linux AppImage (`fsx.swap`), Windows MSIX (`addPackage`)
-  or `.exe` (rename dance). **Impossible on snap/flatpak** (swap target is the
-  read-only install mount) — those update via their stores; an attempted apply
-  throws in the worker and the renderer hangs.
-- One-shot latch: `applied = true` is set **before** the swap → a failed apply
-  can't be retried in-process; the worker handler has no try/catch and the main
-  promise no reject/timeout → every failure mode is a silent hang. Real update UX
-  needs a try/catch + failure reply in the worker.
-- Dev (`--updates`): download path only — apply would target a file named `'null'`.
+Do not add an updater worker, OTA renderer flow, background update checks, staged deployment,
+or apply/relaunch behavior under the PearDrop MVP. Treat any such work as a separate product
+change requiring an approved plan and a fresh review of packaging, signing, platform stores,
+and release metadata.
 
-Seeding / replication:
-
-- Apps join the drive client-only and never seed — run dedicated `pear seed`ers.
-- `store.replicate` is registered **only when updates are enabled**: app data in
-  the worker's corestore won't replicate under the dev default `--no-updates`.
-  When adding app P2P storage, hoist `swarm.on('connection', (c) =>
-store.replicate(c))` out of the updates-gated block and `swarm.join` your app
-  topic separately — only the updater-drive join stays gated behind `updates`.
-
-Surface the template doesn't use (see the `pear-runtime` / `pear-runtime-updater`
-READMEs): updater opts `delay` (rollout cap; `0` = instant, good for tests),
-`storage`, `bootstrap` (local DHT), `bundled`; events `error` (attach a listener or
-a crash), `update-scheduled`, `updating-progress`, `updating-delta`;
-`updater.next` = staged path for custom install logic. `PearRuntime` without
-`store`/`swarm` creates its own (pass both or neither).
+Preserve `pear.json`, `forge.config.js`, `build/`, `flatpak/`, and release workflows while
+working on transfer features. Their presence does not make the current PearDrop demo a signed,
+published, or supported distributable.

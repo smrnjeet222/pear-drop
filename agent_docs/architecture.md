@@ -1,47 +1,139 @@
-# Architecture notes (`electron/`, `renderer/`, `workers/`)
+# PearDrop architecture (`electron/`, `renderer/`, `workers/`)
 
-> Read before editing `electron/`, `renderer/`, or `workers/`, or when debugging
-> worker spawn, IPC, or startup crashes. Only non-obvious, code-verified facts —
-> the code is the reference for everything else. Index: [AGENTS.md](../AGENTS.md).
+> Read this before editing Electron, renderer, worker composition, IPC, storage, or startup.
+> Keep only non-obvious, code-verified facts here; source remains authoritative.
 
-Renderer (sandboxed) ↔ `window.bridge` (Electron IPC) ↔ main (broker only) ↔ fd-3
-FramedStream pipe ↔ Bare worker (`hello-pear-worker`: swarm + corestore + updater).
-The code is small — read it for the wiring; below are only the non-obvious facts.
+## Process boundary
 
-- The paparam parse at the top of `electron/main.js` throws on **any** unknown flag
-  or positional → packaged app crashes at startup. This also makes Win/Linux deep
-  links unreachable (a URL in argv kills the process before the single-instance
-  lock; only macOS `'open-url'` works).
-- The worker specifier `'/workers/main.js'` is the worker's **identity** — embedded
-  in every IPC channel name; must start with `/`; `pear:startWorker` resolves any
-  renderer-supplied specifier with **no allowlist**.
-- Six-arg spawn order (`getWorker()` → worker argv): `updates`, `version`,
-  `upgrade`, bundle name (`productName`+ext), storage dir, installed app path.
-  Cross-package contract with `hello-pear-worker` — wrong-but-parseable orders fail
-  silently. (Worker reads at offset +2 on desktop, 0 on mobile/BareKit; the package
-  is shared with `pear-mobile` hosts.)
-- The worker is a module for cross-platform reuse (desktop + mobile). For a
-  single-platform project, copy `hello-pear-worker/index.js` into
-  `workers/main.js` and develop it in-project (per that package's README).
-- Once the worker is in-project it resolves against **this** `package.json`, not the
-  package's — so Node builtins it uses need an `imports` entry (see AGENTS.md
-  contracts). A missing entry only fails in a packaged build.
-- Pipe protocol = plain UTF-8 strings in FramedStream frames, matched by exact
-  equality. Unknown →worker strings get `console.log`ged; unknown worker→ strings
-  are forwarded to the renderer.
-- `pear:applyUpdate` is hardwired to `'/workers/main.js'`, lazily respawns a dead
-  worker, and its promise has no reject/timeout — any failure = renderer hangs.
-- `sendToAll` broadcasts every worker channel to **all** windows; nothing restarts
-  a crashed worker.
-- Per-platform storage dir is chosen in `getWorker()` (dev:
-  `<tmpdir>/pear/HelloPear`). Inside: `pear-runtime/corestore`,
-  `pear-runtime/next/<length>.<fork>/` (wiped on every updates-enabled launch),
-  `app-storage/` (suggested `pear.storage` for app data).
-- **A stall is usually the network, not the code, and the two look identical.** An
-  update that never arrives, or a peer that never connects, most often means this
-  machine is unreachable: `pear seed <link> --json` prints `firewalled` and
-  `natType`, and `natType: "Random"` is symmetric NAT, which defeats holepunching
-  (`upload.totalBytes` then stays 0 however long it runs). Before debugging app
-  logic, connect two bare Hyperswarm instances on a random topic with no app code —
-  if that fails, nothing above it can work. Exercise real replication against a
-  local `hyperdht/testnet` rather than the public DHT.
+```text
+sandboxed renderer
+  -> window.peardrop intents
+  -> Electron IPC
+  -> DropController
+       -> native dialogs, clipboard, completed-path allowlist, shell.showItemInFolder
+       -> WorkerBroker
+  -> FramedStream JSON over PearRuntime/Bare.IPC
+  -> TransferEngine
+       -> Corestore session, Hyperdrive, Hyperswarm, bare-fs streams
+```
+
+The renderer does not start workers or select worker specifiers. `electron/main.js` resolves
+`workers/main.js` itself and launches exactly that file through
+`PearRuntime.run(entrypoint, [workerStorage])`.
+
+## Startup and storage
+
+1. `paparam` accepts `--storage <dir>`, the development-compatible no-op `--no-updates`, and
+   Electron's hidden `--no-sandbox` flag. Unknown arguments still fail parsing.
+2. A custom `--storage` path becomes Electron `userData`; otherwise Electron's current
+   platform `userData` path is the storage root.
+3. Main passes `<storage>/app-storage/peardrop-corestore` as the worker's only app argument.
+4. Bare reads that path from `Bare.argv[2]` and keeps one root Corestore open until shutdown.
+5. Separate `--storage` roots permit two source instances without sharing a Corestore.
+
+The app does not take a single-instance lock. Never run two instances against the same
+storage root.
+
+## Electron ownership
+
+`DropController` associates every request with the originating `webContents`. Only main may:
+
+- authorize a source through `dialog.showOpenDialog({ properties: ['openFile'] })`
+- authorize a destination through `dialog.showSaveDialog({ defaultPath: safeName })`
+- copy an active sender capability
+- allowlist a completed destination by request ID and owner
+- reveal that allowlisted destination with `shell.showItemInFolder` without launching it
+
+Navigation or renderer destruction cancels unfinished receive work and clears output
+authorization. Closing the last window quits the app, so active sharing cannot remain hidden
+without a controllable renderer.
+
+## Preload surface
+
+`electron/preload.js` exposes only `window.peardrop`:
+
+```js
+{
+  ;(getSnapshot, chooseAndShare, receive, cancel, reset, copyCapability, openReceived, onEvent)
+}
+```
+
+Request-taking methods validate UUID shape in preload. `receive` accepts a string only.
+`onEvent` returns an unsubscribe function. The BrowserWindow keeps renderer sandboxing and
+context isolation enabled and Node integration disabled.
+
+No preload method accepts a source path, destination path, shell path, worker specifier, raw
+frame, or bytes. Main may return an allowlisted output path only after a completed receive.
+
+## Host/worker protocol
+
+`lib/protocol.js` validates every frame before dispatch. Frames are exact-schema UTF-8 JSON,
+protocol version 1, and at most 16 KiB.
+
+Main commands:
+
+- `state.get`
+- `share.start { sourcePath }`
+- `receive.inspect { capability }`
+- `receive.start { destinationPath }`
+- `transfer.cancel`
+- `transfer.reset`
+- `worker.shutdown`
+
+Worker events:
+
+- `worker.ready { snapshot }`
+- `command.accepted { command }`
+- `state.changed { mode, state, file?, capability?, bytes?, peers? }`
+- `receive.metadata { file }`
+- `transfer.progress { phase, transferred, total }`
+- `transfer.error { error }`
+- `worker.closed`
+
+Pipe write is not command acceptance. `WorkerBroker` waits up to three seconds for the
+matching `command.accepted`, and worker readiness is bounded to five seconds. Raw worker
+stdout/stderr stays in main's local logs and is not forwarded to the renderer.
+
+## Transfer resources
+
+A send owns a unique `store.namespace('send-' + requestId)`, writable Hyperdrive, server-side
+Hyperswarm join, discovery handle, replication connections, and source/drive streams. A
+receive owns an independent `store.session()`, a public-key Hyperdrive that must be
+read-only, a client-side join, and drive/output streams.
+
+Cancel and failure cleanup follows this order:
+
+1. Mark the transfer terminal and destroy active streams.
+2. Destroy discovery and swarm connections.
+3. Remove partial output when present.
+4. Close the drive and transfer store session.
+5. Clear timers and emit one terminal state.
+
+The root Corestore closes only at worker shutdown. `WorkerBroker` asks for `worker.shutdown`,
+waits for `worker.closed` within the remaining three-second budget, then destroys the pipe or
+raw worker if needed. Main shares one idempotent, three-second shutdown promise between normal
+`before-quit` handling and each Windows window's `query-session-end` handler; Windows session
+end delays briefly for cleanup and then uses `app.exit(0)`. The worker also registers
+idempotent cleanup with `graceful-goodbye`.
+
+## Renderer state
+
+The renderer displays authoritative snapshots and events. It does not infer network or file
+completion from an IPC promise. A promise confirms command acceptance only.
+
+- Send: `idle -> preparing -> announcing -> sharing -> stopping -> idle`
+- Receive: `idle -> discovering -> awaiting-destination -> transferring -> verifying -> completed`
+- Either flow may enter `failed`; receive cancellation passes through `cancelling`.
+
+Progress comes only from `transfer.progress` or the latest authoritative byte snapshot.
+Completed output text and **Show in folder** appear only when main includes the authorized path.
+
+## Integration tests
+
+`test/integration/two-peer.test.js` uses separate temporary Corestores and separate
+`hyperdht/testnet` nodes. This proves local Hyperdrive/Hyperswarm replication, read-only
+receiver behavior, byte equality, progress monotonicity, interruption handling, and partial
+cleanup. It does not prove public-DHT reachability or NAT traversal.
+
+`test/integration/worker-ipc.test.js` launches the real fixed worker through `PearRuntime.run`,
+waits for readiness, exercises framed command handling, and checks graceful shutdown.

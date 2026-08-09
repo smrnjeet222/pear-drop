@@ -1,48 +1,207 @@
 <!doctype html>
-<html>
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <title>Hello Pear</title>
-    <style>
-      body {
-        font-family:
-          -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-        display: flex;
-        justify-content: center;
-        align-items: center;
-        height: 100vh;
-        margin: 0;
-        background: linear-gradient(135deg, #21c437 0%, #0e4f15 100%);
-        color: white;
-      }
-      h1 {
-        font-size: 48px;
-        text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
-      }
-      #update-btn {
-        display: none;
-        margin-top: 20px;
-        padding: 12px 24px;
-        font-size: 18px;
-        border: 2px solid white;
-        border-radius: 8px;
-        background: green;
-        color: white;
-        cursor: pointer;
-      }
-      #update-btn:hover {
-        background: greenyellow;
-      }
-      .container {
-        text-align: center;
-      }
-    </style>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <title>PearDrop</title>
+    <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <div class="container">
-      <h1 id="v">v</h1>
-      <button id="update-btn">Apply update</button>
+    <div class="app-shell">
+      <header class="masthead">
+        <a class="brand" href="#main-content" aria-label="PearDrop home">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span>PearDrop</span>
+        </a>
+        <p class="scope-note">One file, directly between two devices.</p>
+      </header>
+
+      <main id="main-content">
+        <section class="intro" aria-labelledby="page-title">
+          <p class="eyebrow">Direct file handoff</p>
+          <h1 id="page-title">Send a file. Receive a file.</h1>
+          <p class="intro-copy">
+            No account or upload server. Keep the sending app open until the receiver finishes.
+          </p>
+        </section>
+
+        <p id="app-live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
+        <div class="error-box app-error" id="action-error" role="alert" hidden>
+          <strong>Action failed</strong>
+          <span id="action-error-message"></span>
+        </div>
+
+        <div class="transfer-grid">
+          <section class="panel" id="send-panel" aria-labelledby="send-title">
+            <div class="panel-heading">
+              <span class="step-number" aria-hidden="true">01</span>
+              <div>
+                <h2 id="send-title">Send</h2>
+                <p>Choose one file up to 25 MB.</p>
+              </div>
+            </div>
+
+            <div class="panel-body">
+              <button class="button button-primary" id="choose-file" type="button">
+                Choose file
+              </button>
+
+              <div class="transfer-state" id="send-state" hidden>
+                <div class="state-heading">
+                  <div>
+                    <p class="state-label" id="send-state-label">Preparing file</p>
+                    <p class="file-detail" id="send-file"></p>
+                  </div>
+                  <span class="state-badge" id="send-badge">Preparing</span>
+                </div>
+
+                <div class="progress-block" id="send-progress-block" hidden>
+                  <div class="progress-copy">
+                    <span id="send-progress-label">Preparing</span>
+                    <span id="send-progress-value">0%</span>
+                  </div>
+                  <progress
+                    id="send-progress"
+                    aria-labelledby="send-progress-label"
+                    max="100"
+                    value="0"
+                  >
+                    0%
+                  </progress>
+                  <p class="byte-count" id="send-bytes"></p>
+                </div>
+
+                <div class="capability-block" id="capability-block" hidden>
+                  <div class="field-label-row">
+                    <span class="field-label">Read capability</span>
+                    <span
+                      class="copy-confirmation"
+                      id="copy-confirmation"
+                      aria-live="polite"
+                    ></span>
+                  </div>
+                  <code class="capability" id="capability-value"></code>
+                  <p class="field-help">
+                    Anyone with this key can receive the file while sharing is active.
+                  </p>
+                  <button class="button button-secondary" id="copy-capability" type="button">
+                    Copy key
+                  </button>
+                </div>
+
+                <div class="error-box" id="send-error" role="alert" hidden>
+                  <strong>Sharing stopped</strong>
+                  <span id="send-error-message"></span>
+                </div>
+
+                <div class="button-row">
+                  <button class="button button-danger" id="stop-sharing" type="button" hidden>
+                    Stop sharing
+                  </button>
+                  <button class="button button-secondary" id="reset-send" type="button" hidden>
+                    Start over
+                  </button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel" id="receive-panel" aria-labelledby="receive-title">
+            <div class="panel-heading">
+              <span class="step-number" aria-hidden="true">02</span>
+              <div>
+                <h2 id="receive-title">Receive</h2>
+                <p>Paste the sender's 64-character key.</p>
+              </div>
+            </div>
+
+            <div class="panel-body">
+              <form id="receive-form" novalidate>
+                <label class="field-label" for="capability-input">Read capability</label>
+                <textarea
+                  id="capability-input"
+                  name="capability"
+                  rows="3"
+                  maxlength="80"
+                  autocomplete="off"
+                  autocapitalize="none"
+                  spellcheck="false"
+                  placeholder="Paste 64 characters"
+                  aria-describedby="capability-help"
+                  required
+                ></textarea>
+                <p class="field-help" id="capability-help">
+                  This is read access, not a password or identity.
+                </p>
+                <button class="button button-primary" id="receive-file" type="submit">
+                  Find sender
+                </button>
+              </form>
+
+              <div class="transfer-state" id="receive-state" hidden>
+                <div class="state-heading">
+                  <div>
+                    <p class="state-label" id="receive-state-label">Looking for sender</p>
+                    <p class="file-detail" id="receive-file-detail"></p>
+                  </div>
+                  <span class="state-badge" id="receive-badge">Discovering</span>
+                </div>
+
+                <div class="progress-block" id="receive-progress-block" hidden>
+                  <div class="progress-copy">
+                    <span id="receive-progress-label">Receiving</span>
+                    <span id="receive-progress-value">0%</span>
+                  </div>
+                  <progress
+                    id="receive-progress"
+                    aria-labelledby="receive-progress-label"
+                    max="100"
+                    value="0"
+                  >
+                    0%
+                  </progress>
+                  <p class="byte-count" id="receive-bytes"></p>
+                </div>
+
+                <div class="completion-block" id="completion-block" hidden>
+                  <span class="field-label">Saved to</span>
+                  <code class="output-path" id="output-path"></code>
+                  <button class="button button-primary" id="open-received" type="button">
+                    Show in folder
+                  </button>
+                </div>
+
+                <div class="error-box" id="receive-error" role="alert" hidden>
+                  <strong>Handoff failed</strong>
+                  <span id="receive-error-message"></span>
+                </div>
+
+                <div class="button-row">
+                  <button class="button button-danger" id="cancel-receive" type="button" hidden>
+                    Cancel
+                  </button>
+                  <button class="button button-secondary" id="reset-receive" type="button" hidden>
+                    Receive another
+                  </button>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </main>
+
+      <footer>
+        <p>
+          Transfers use Noise-encrypted transport. PearDrop keeps transfer data in local app storage
+          and does not claim encryption at rest.
+        </p>
+      </footer>
     </div>
-    <script type="module" src="app.js"></script>
+
+    <script src="app.js"></script>
   </body>
 </html>

@@ -1,215 +1,121 @@
-const { app, BrowserWindow, ipcMain } = require('electron')
-const os = require('os')
-const path = require('path')
-const PearRuntime = require('pear-runtime')
-const FramedStream = require('framed-stream')
+const path = require('node:path')
 
-const { isMac, isLinux, isWindows } = require('which-runtime')
+const { app, BrowserWindow, clipboard, dialog, ipcMain, shell } = require('electron')
 const { command, flag } = require('paparam')
+
+const DropController = require('./drop-controller')
+const WorkerBroker = require('./worker-broker')
 const pkg = require('../package.json')
-const { name, productName, version, upgrade } = pkg
-
-const protocol = name
-const mainWorkerSpecifier = '/workers/main.js'
-
-const workers = new Map()
-
-const appName = productName ?? name
 
 const cmd = command(
-  appName,
-  flag('--storage <dir>', 'pass custom storage to pear-runtime'),
-  flag('--no-updates', 'start without OTA updates'),
+  pkg.productName || pkg.name,
+  flag('--storage <dir>', 'use a custom PearDrop storage directory'),
+  flag('--no-updates', 'accepted for development compatibility').hide(),
   flag('--no-sandbox', 'start without Chromium sandbox').hide()
 )
 
 cmd.parse(app.isPackaged ? process.argv.slice(1) : process.argv.slice(2))
 
-const pearStore = cmd.flags.storage
-const updates = cmd.flags.updates
+const storageRoot = cmd.flags.storage ? path.resolve(cmd.flags.storage) : app.getPath('userData')
 
-if (pearStore) app.setPath('userData', pearStore)
+if (cmd.flags.storage) app.setPath('userData', storageRoot)
 
-ipcMain.on('pkg', (evt) => {
-  evt.returnValue = pkg
-})
+const workerStorage = path.join(storageRoot, 'app-storage', 'peardrop-corestore')
+const workerEntrypoint = require.resolve('../workers/main.js')
 
-function getAppPath() {
-  if (!app.isPackaged) return null
-  if (isLinux && process.env.APPIMAGE) return process.env.APPIMAGE
-  if (isWindows) return process.execPath
-  return path.join(process.resourcesPath, '..', '..')
+const SHUTDOWN_TIMEOUT = 3_000
+
+let controller = null
+let quitting = false
+let readyToQuit = false
+let shutdownPromise = null
+let sessionEndPromise = null
+
+function shutdownController() {
+  if (shutdownPromise) return shutdownPromise
+
+  let timer
+  const deadline = new Promise((resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error('PearDrop shutdown deadline exceeded')),
+      SHUTDOWN_TIMEOUT
+    )
+  })
+  deadline.catch(() => {})
+
+  shutdownPromise = Promise.race([Promise.resolve().then(() => controller?.shutdown()), deadline])
+    .catch((err) => console.error('PearDrop shutdown failed:', err))
+    .finally(() => clearTimeout(timer))
+  return shutdownPromise
 }
 
-function sendToAll(name, data) {
-  for (const win of BrowserWindow.getAllWindows()) {
-    if (!win.isDestroyed()) win.webContents.send(name, data)
-  }
+function handleSessionEnd(event) {
+  event.preventDefault()
+  if (sessionEndPromise) return
+
+  sessionEndPromise = shutdownController().finally(() => app.exit(0))
 }
 
-function getWorker(specifier) {
-  if (workers.has(specifier)) return workers.get(specifier)
-  const appPath = getAppPath()
-  let dir = null
-  if (pearStore) {
-    console.log('pear store: ' + pearStore)
-    dir = pearStore
-  } else if (appPath === null) {
-    dir = path.join(os.tmpdir(), 'pear', appName)
-  } else {
-    const isSnap = !!process.env.SNAP_USER_COMMON
-    const linuxConfigHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config')
-    dir = isMac
-      ? path.join(os.homedir(), 'Library', 'Application Support', appName)
-      : isLinux
-        ? isSnap
-          ? path.join(process.env.SNAP_USER_COMMON, appName)
-          : path.join(linuxConfigHome, appName)
-        : path.join(os.homedir(), 'AppData', 'Local', appName)
-  }
-
-  const extension = isLinux ? '.AppImage' : isMac ? '.app' : '.msix'
-
-  const worker = PearRuntime.run(require.resolve('..' + specifier), [
-    updates,
-    version,
-    upgrade,
-    productName + extension,
-    dir,
-    appPath
-  ])
-  const pipe = new FramedStream(worker)
-
-  function sendWorkerStdout(data) {
-    sendToAll('pear:worker:stdout:' + specifier, data)
-  }
-  function sendWorkerStderr(data) {
-    sendToAll('pear:worker:stderr:' + specifier, data)
-  }
-  function sendWorkerIPC(data) {
-    sendToAll('pear:worker:ipc:' + specifier, data)
-  }
-  function onBeforeQuit() {
-    pipe.destroy()
-  }
-  ipcMain.handle('pear:worker:writeIPC:' + specifier, (evt, data) => {
-    return pipe.write(data)
+function createController() {
+  const broker = new WorkerBroker({
+    entrypoint: workerEntrypoint,
+    storagePath: workerStorage
   })
-  workers.set(specifier, pipe)
-  pipe.on('data', sendWorkerIPC)
-  worker.stdout.on('data', sendWorkerStdout)
-  worker.stderr.on('data', sendWorkerStderr)
-  worker.once('exit', (code) => {
-    app.removeListener('before-quit', onBeforeQuit)
-    ipcMain.removeHandler('pear:worker:writeIPC:' + specifier)
-    pipe.removeListener('data', sendWorkerIPC)
-    worker.stdout.removeListener('data', sendWorkerStdout)
-    worker.stderr.removeListener('data', sendWorkerStderr)
-    sendToAll('pear:worker:exit:' + specifier, code)
-    workers.delete(specifier)
+
+  return new DropController({
+    broker,
+    dialog,
+    clipboard,
+    shell,
+    getWindow: (webContents) => BrowserWindow.fromWebContents(webContents)
   })
-  app.on('before-quit', onBeforeQuit)
-  return pipe
 }
 
 async function createWindow() {
   const win = new BrowserWindow({
-    width: 800,
-    height: 600,
+    width: 1040,
+    height: 720,
+    minWidth: 760,
+    minHeight: 620,
+    show: false,
+    backgroundColor: '#f4f1e9',
+    title: 'PearDrop',
     webPreferences: {
-      preload: path.join(__dirname, '..', 'electron', 'preload.js'),
+      preload: path.join(__dirname, 'preload.js'),
       sandbox: true,
       nodeIntegration: false,
       contextIsolation: true
     }
   })
 
-  const devServerUrl = process.env.PEAR_DEV_SERVER_URL
-
-  if (devServerUrl) {
-    await win.loadURL(devServerUrl)
-    win.webContents.openDevTools()
-    return
-  }
-
+  if (process.platform === 'win32') win.on('query-session-end', handleSessionEnd)
+  win.once('ready-to-show', () => win.show())
   await win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'))
+  return win
 }
 
-ipcMain.handle('pear:applyUpdate', () => {
-  const pipe = getWorker(mainWorkerSpecifier)
+app.on('before-quit', (event) => {
+  if (readyToQuit) return
+  event.preventDefault()
+  if (quitting) return
+  quitting = true
 
-  return new Promise((resolve, reject) => {
-    function onData(data) {
-      const message = data.toString()
-
-      if (message === 'pear:updateApplied') {
-        pipe.removeListener('data', onData)
-        resolve()
-      }
-    }
-
-    pipe.on('data', onData)
-    pipe.write('pear:applyUpdate')
+  shutdownController().finally(() => {
+    readyToQuit = true
+    app.quit()
   })
 })
-ipcMain.handle('pear:startWorker', (evt, filename) => {
-  getWorker(filename)
-  return true
-})
-ipcMain.handle('app:afterUpdate', () => {
-  if (isLinux && process.env.APPIMAGE) {
-    app.relaunch({
-      execPath: process.env.APPIMAGE,
-      args: [
-        '--appimage-extract-and-run',
-        ...process.argv.slice(1).filter((arg) => arg !== '--appimage-extract-and-run')
-      ]
-    })
-  } else if (!isWindows) {
-    app.relaunch()
+
+app.whenReady().then(async () => {
+  try {
+    controller = createController()
+    controller.installIpc(ipcMain)
+    await controller.start()
+    await createWindow()
+  } catch (err) {
+    console.error('PearDrop failed to start:', err)
+    app.quit()
   }
-  app.quit()
 })
 
-function handleDeepLink(url) {
-  console.log('deep link:', url)
-}
-
-app.setAsDefaultProtocolClient(protocol)
-
-app.on('open-url', (evt, url) => {
-  evt.preventDefault()
-  handleDeepLink(url)
-})
-
-const lock = app.requestSingleInstanceLock()
-
-if (!lock) {
-  app.quit()
-} else {
-  app.on('second-instance', (evt, args) => {
-    const url = args.find((arg) => arg.startsWith(protocol + '://'))
-    if (url) handleDeepLink(url)
-  })
-
-  app.whenReady().then(() => {
-    createWindow().catch((err) => {
-      console.error('Failed to create window:', err)
-      app.quit()
-    })
-
-    app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) {
-        createWindow().catch((err) => {
-          console.error('Failed to create window:', err)
-        })
-      }
-    })
-  })
-
-  app.on('window-all-closed', () => {
-    if (process.platform !== 'darwin') {
-      app.quit()
-    }
-  })
-}
+app.on('window-all-closed', () => app.quit())
