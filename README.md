@@ -4,6 +4,9 @@ Send one file directly to another PearDrop instance with a copyable read capabil
 PearDrop is a macOS source-run demo built with Electron, a Bare worker, Hyperdrive, and
 Hyperswarm.
 
+<img width="2048" height="829" alt="image" src="https://github.com/user-attachments/assets/86ab159b-58d7-474f-bb2b-8b5fd599207a" />
+
+
 ## Run the demo
 
 1. Install dependencies.
